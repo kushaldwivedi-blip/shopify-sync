@@ -2,7 +2,9 @@ name: Shopify Sync
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '30 2 * * *'
+    - cron: '30 8 * * *'
+    - cron: '30 14 * * *'
   workflow_dispatch:
 
 jobs:
@@ -16,9 +18,11 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests pymongo
 
       - name: Run Shopify Export
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
         run: python shopify_export.py
 
       - name: Save CSV
