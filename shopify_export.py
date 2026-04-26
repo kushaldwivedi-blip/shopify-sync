@@ -1,13 +1,17 @@
 import requests
 import csv
 import time
+import os
+from pymongo import MongoClient
+from datetime import datetime, timezone
 
 # ============================================================
-#  CONFIG — apna data yahan daalo
+#  CONFIG
 # ============================================================
 SHOP_NAME    = "kbwebm"
 ACCESS_TOKEN = "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"
 API_VERSION  = "2024-01"
+MONGO_URI    = os.environ.get("MONGO_URI")
 # ============================================================
 
 BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/{API_VERSION}"
@@ -16,22 +20,18 @@ HEADERS  = {
     "Content-Type": "application/json",
 }
 
-OUTPUT_FILE    = "shopify_orders.csv"
+OUTPUT_FILE     = "shopify_orders.csv"
 ORDERS_PER_PAGE = 250
 
 CSV_FIELDS = [
     "order_id", "order_number", "created_at", "updated_at", "processed_at",
     "fulfillment_status", "financial_status", "order_status",
-
     "customer_id", "customer_email", "customer_first_name", "customer_last_name",
     "customer_phone", "customer_orders_count",
-
     "shipping_name", "shipping_address1", "shipping_address2",
     "shipping_city", "shipping_province", "shipping_zip", "shipping_country",
-
     "currency", "subtotal_price", "total_discounts", "total_tax",
     "total_shipping", "total_price", "payment_gateway", "refund_amount",
-
     "line_item_id", "line_item_product_id", "line_item_variant_id",
     "line_item_sku", "line_item_title", "line_item_variant_title",
     "line_item_quantity", "line_item_price", "line_item_total_discount",
@@ -42,7 +42,6 @@ CSV_FIELDS = [
 # ── helpers ──────────────────────────────────────────────────
 
 def parse_next_link(link_header: str):
-    """Shopify cursor-based pagination — extract the 'next' URL."""
     if not link_header:
         return None
     for part in link_header.split(","):
@@ -90,19 +89,18 @@ def fetch_all_orders():
             continue
 
         if resp.status_code == 401:
-            print("\n❌ 401 Unauthorized — Access token galat hai ya permissions nahi hain.")
+            print("\n❌ 401 Unauthorized — Access token galat hai.")
             raise SystemExit(1)
 
         resp.raise_for_status()
-
         batch = resp.json().get("orders", [])
         orders.extend(batch)
-        print(f"{len(batch)} orders fetched (total so far: {len(orders)})")
+        print(f"{len(batch)} orders fetched (total: {len(orders)})")
 
         url    = parse_next_link(resp.headers.get("Link", ""))
-        params = {}          # pagination URLs already contain all params
+        params = {}
         page  += 1
-        time.sleep(0.5)      # be polite to the API
+        time.sleep(0.5)
 
     return orders
 
@@ -131,14 +129,12 @@ def flatten_order(order):
         "fulfillment_status": order.get("fulfillment_status") or "unfulfilled",
         "financial_status":   order.get("financial_status"),
         "order_status":       "cancelled" if order.get("cancel_reason") else "open",
-
         "customer_id":           customer.get("id"),
         "customer_email":        customer.get("email") or order.get("email"),
         "customer_first_name":   customer.get("first_name"),
         "customer_last_name":    customer.get("last_name"),
         "customer_phone":        customer.get("phone"),
         "customer_orders_count": customer.get("orders_count"),
-
         "shipping_name":     shipping.get("name"),
         "shipping_address1": shipping.get("address1"),
         "shipping_address2": shipping.get("address2"),
@@ -146,7 +142,6 @@ def flatten_order(order):
         "shipping_province": shipping.get("province"),
         "shipping_zip":      shipping.get("zip"),
         "shipping_country":  shipping.get("country"),
-
         "currency":         order.get("currency"),
         "subtotal_price":   order.get("subtotal_price"),
         "total_discounts":  order.get("total_discounts"),
@@ -180,7 +175,7 @@ def flatten_order(order):
     return rows
 
 
-# ── export ────────────────────────────────────────────────────
+# ── export CSV ────────────────────────────────────────────────
 
 def export_to_csv(orders):
     all_rows = []
@@ -195,13 +190,44 @@ def export_to_csv(orders):
     return len(all_rows)
 
 
+# ── save to MongoDB ───────────────────────────────────────────
+
+def save_to_mongodb(orders):
+    if not MONGO_URI:
+        print("⚠️  MONGO_URI nahi mila — MongoDB skip kar raha hoon.")
+        return
+
+    client = MongoClient(MONGO_URI)
+    db     = client["shopify"]
+    col    = db["orders"]
+
+    all_rows = []
+    for order in orders:
+        all_rows.extend(flatten_order(order))
+
+    if all_rows:
+        col.delete_many({})           # purana data delete karo
+        col.insert_many(all_rows)     # naya data insert karo
+        print(f"✅ MongoDB updated! {len(all_rows)} rows inserted.")
+    else:
+        print("⚠️  Koi data nahi mila insert karne ke liye.")
+
+    # Last sync time update karo
+    db["sync_log"].replace_one(
+        {"_id": "last_sync"},
+        {"_id": "last_sync", "synced_at": datetime.now(timezone.utc).isoformat()},
+        upsert=True
+    )
+
+    client.close()
+
+
 # ── main ──────────────────────────────────────────────────────
 
 def main():
     print("=" * 50)
-    print("  Shopify → CSV Export")
+    print("  Shopify → CSV + MongoDB Export")
     print(f"  Store : {SHOP_NAME}.myshopify.com")
-    print(f"  Output: {OUTPUT_FILE}")
     print("=" * 50)
 
     print("\n📦 Fetching orders...")
@@ -210,8 +236,12 @@ def main():
 
     print("\n💾 Writing CSV...")
     total_rows = export_to_csv(orders)
-    print(f"✅ CSV ready! {total_rows} rows written to '{OUTPUT_FILE}'")
-    print("\n🎯 Ab PowerBI mein import karo!")
+    print(f"✅ CSV ready! {total_rows} rows written.")
+
+    print("\n🍃 Saving to MongoDB...")
+    save_to_mongodb(orders)
+
+    print("\n🎯 Done! PowerBI se MongoDB connect karo.")
 
 
 if __name__ == "__main__":
